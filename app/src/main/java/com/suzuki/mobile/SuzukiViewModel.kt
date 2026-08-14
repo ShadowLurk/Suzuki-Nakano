@@ -1,12 +1,14 @@
 package com.suzuki.mobile
 
 import android.app.Application
+import android.media.MediaPlayer
 import android.media.MediaRecorder
 import android.speech.tts.TextToSpeech
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.suzuki.mobile.data.MemoryStore
 import com.suzuki.mobile.data.Persona
+import com.suzuki.mobile.net.EdgeTtsClient
 import com.suzuki.mobile.net.GroqClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -37,13 +39,10 @@ class SuzukiViewModel(application: Application) : AndroidViewModel(application) 
     val state: StateFlow<SuzukiUiState> = _state
 
     private var tts: TextToSpeech? = null
+    private var mediaPlayer: MediaPlayer? = null
     private var gravador: MediaRecorder? = null
     private var arquivoAudio: File? = null
 
-    // Histórico curto da conversa atual (equivalente ao
-    // _formatar_conversa_recente do language.py desktop) — mostra
-    // as últimas trocas pra ela não parecer amnésica dentro da
-    // mesma sessão.
     private val historicoSessao = mutableListOf<String>()
 
     init {
@@ -63,10 +62,6 @@ class SuzukiViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun getApiKey(): String = prefs.getString("groq_api_key", "") ?: ""
-
-    // =========================
-    // ENVIO DE TEXTO
-    // =========================
 
     fun enviarTexto(texto: String) {
         if (texto.isBlank()) return
@@ -99,9 +94,6 @@ class SuzukiViewModel(application: Application) : AndroidViewModel(application) 
 
                 falar(resposta)
 
-                // Captura de memória em background, sem travar a UI
-                // (equivalente ao brain/perception/memoria_llm.py do
-                // desktop: verifica se a fala tinha algo memorável).
                 viewModelScope.launch(Dispatchers.IO) {
                     capturarMemoria(chave, texto)
                 }
@@ -126,7 +118,7 @@ class SuzukiViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun capturarMemoria(chave: String, texto: String) {
-        if (texto.length < 20) return  // fala curta demais, não vale a chamada extra
+        if (texto.length < 20) return
 
         try {
             val client = GroqClient(chave)
@@ -163,14 +155,8 @@ class SuzukiViewModel(application: Application) : AndroidViewModel(application) 
                 else -> memoria.addFato(textoFinal)
             }
         } catch (_: Exception) {
-            // Falha silenciosa: nunca deixa a captura de memória
-            // quebrar a conversa principal.
         }
     }
-
-    // =========================
-    // ÁUDIO (gravar -> transcrever -> mandar como texto)
-    // =========================
 
     fun iniciarGravacao() {
         val app = getApplication<Application>()
@@ -202,7 +188,6 @@ class SuzukiViewModel(application: Application) : AndroidViewModel(application) 
                 release()
             }
         } catch (_: Exception) {
-            // gravação muito curta às vezes falha no stop(); ignora
         }
         gravador = null
         _state.update { it.copy(gravando = false, processando = true) }
@@ -229,12 +214,34 @@ class SuzukiViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun falar(texto: String) {
-        tts?.speak(texto, TextToSpeech.QUEUE_FLUSH, null, null)
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val mp3 = EdgeTtsClient.sintetizar(texto)
+                val arquivo = File(getApplication<Application>().cacheDir, "fala_${System.currentTimeMillis()}.mp3")
+                arquivo.writeBytes(mp3)
+
+                withContext(Dispatchers.Main) {
+                    mediaPlayer?.release()
+                    mediaPlayer = MediaPlayer().apply {
+                        setDataSource(arquivo.absolutePath)
+                        setOnCompletionListener { arquivo.delete() }
+                        setOnErrorListener { _, _, _ -> arquivo.delete(); true }
+                        prepare()
+                        start()
+                    }
+                }
+            } catch (_: Exception) {
+                withContext(Dispatchers.Main) {
+                    tts?.speak(texto, TextToSpeech.QUEUE_FLUSH, null, null)
+                }
+            }
+        }
     }
 
     override fun onCleared() {
         tts?.stop()
         tts?.shutdown()
+        mediaPlayer?.release()
         super.onCleared()
     }
 }
