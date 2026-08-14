@@ -7,9 +7,11 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
 import java.io.ByteArrayOutputStream
+import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.CountDownLatch
+import kotlin.math.roundToLong
 
 object EdgeTtsClient {
 
@@ -18,17 +20,41 @@ object EdgeTtsClient {
     private const val TOM = "+15Hz"
     private const val VELOCIDADE = "+10%"
 
+    private const val CHROMIUM_FULL_VERSION = "130.0.2849.68"
+    private const val CHROMIUM_MAJOR_VERSION = "130"
+    private const val SEC_MS_GEC_VERSION = "1-$CHROMIUM_FULL_VERSION"
+    private const val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) Chrome/$CHROMIUM_MAJOR_VERSION.0.0.0 Safari/537.36 Edg/$CHROMIUM_MAJOR_VERSION.0.0.0"
+
     private val http = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(20, TimeUnit.SECONDS)
         .build()
 
+    private fun gerarSecMsGec(): String {
+        val winEpoch = 11644473600L
+        val agoraSegundos = System.currentTimeMillis() / 1000.0
+
+        var ticks = agoraSegundos + winEpoch
+        ticks -= ticks % 300
+
+        val ticksEm100ns = (ticks * 1e9 / 100).roundToLong()
+
+        val paraHash = "$ticksEm100ns$TRUSTED_CLIENT_TOKEN"
+        val hash = MessageDigest.getInstance("SHA-256").digest(paraHash.toByteArray(Charsets.US_ASCII))
+
+        return hash.joinToString("") { "%02X".format(it) }
+    }
+
     fun sintetizar(texto: String): ByteArray {
         val connectionId = UUID.randomUUID().toString().replace("-", "")
         val requestId = UUID.randomUUID().toString().replace("-", "")
 
-        val url = "wss://speech.platform.bing.com/consumer/speech/synthesize/" +
-            "readaloud/edge/v1?TrustedClientToken=$TRUSTED_CLIENT_TOKEN&ConnectionId=$connectionId"
+        val url = "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1" +
+            "?TrustedClientToken=$TRUSTED_CLIENT_TOKEN" +
+            "&ConnectionId=$connectionId" +
+            "&Sec-MS-GEC=${gerarSecMsGec()}" +
+            "&Sec-MS-GEC-Version=$SEC_MS_GEC_VERSION"
 
         val audio = ByteArrayOutputStream()
         val latch = CountDownLatch(1)
@@ -36,7 +62,10 @@ object EdgeTtsClient {
 
         val request = Request.Builder()
             .url(url)
+            .addHeader("Pragma", "no-cache")
+            .addHeader("Cache-Control", "no-cache")
             .addHeader("Origin", "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold")
+            .addHeader("User-Agent", USER_AGENT)
             .build()
 
         val listener = object : WebSocketListener() {
@@ -84,7 +113,13 @@ object EdgeTtsClient {
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                erro = t
+                erro = RuntimeException(
+                    "onFailure: ${t.message} (http=${response?.code})", t
+                )
+                latch.countDown()
+            }
+
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 latch.countDown()
             }
         }
@@ -97,10 +132,10 @@ object EdgeTtsClient {
             throw RuntimeException("Timeout esperando o áudio do Edge TTS")
         }
 
-        erro?.let { throw RuntimeException("Falha no Edge TTS: ${it.message}", it) }
+        erro?.let { throw it }
 
         if (audio.size() == 0) {
-            throw RuntimeException("Edge TTS não retornou áudio")
+            throw RuntimeException("Edge TTS não retornou áudio (0 bytes)")
         }
 
         return audio.toByteArray()
